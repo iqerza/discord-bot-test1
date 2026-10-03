@@ -13,7 +13,7 @@ from typing import Optional
 import discord
 from discord import app_commands
 from flask import Flask, jsonify
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 from discord.ext import commands, tasks
 
 
@@ -29,13 +29,14 @@ MIN_MESSAGE_XP = 15
 MAX_MESSAGE_XP = 25
 MAX_TIMEOUT_SECONDS = 28 * 24 * 60 * 60
 VOICE_XP_PER_MINUTE = 10
-LEVEL_CARD_SIZE = (736, 230)
+LEVEL_CARD_SIZE = (780, 300)
+RENDER_SCALE = 2  # البطاقة تنرسم بضعف الدقة (1560×600) عشان تطلع حادة
 LEVEL_CARD_BACKGROUND = (
     Path(__file__).resolve().parent
     / "attached_assets"
     / "background.png"
 )
-PROFILE_CARD_SIZE = (500, 500)
+PROFILE_CARD_SIZE = (500, 580)
 PROFILE_CARD_BACKGROUND = (
     Path(__file__).resolve().parent
     / "attached_assets"
@@ -59,6 +60,10 @@ DAILY_COOLDOWN_HOURS = 24
 DAILY_MIN_AMOUNT = 100
 DAILY_MAX_AMOUNT = 500
 MAX_ADMIN_GRANT = 10_000_000
+
+# حدود أوامر set / send للـ XP واللفل
+MAX_XP_VALUE = 10_000_000
+MAX_LEVEL_VALUE = 1000
 
 database = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
 database.row_factory = sqlite3.Row
@@ -228,6 +233,11 @@ def level_from_xp(xp: int) -> int:
     return int((xp / 100) ** 0.5)
 
 
+def xp_for_level(level: int) -> int:
+    """أقل XP يحتاجه العضو ليكون في هذا المستوى."""
+    return level**2 * 100
+
+
 def progress_for_xp(xp: int) -> tuple[int, int, int]:
     """يعيد المستوى الحالي وXP المستوى التالي ونسبة التقدم."""
     current_level = level_from_xp(xp)
@@ -294,6 +304,23 @@ def add_member_xp(
     database.commit()
     add_period_xp(guild_id, user_id, amount, source)
     return old_xp, new_xp
+
+
+def set_member_xp_raw(guild_id: int, user_id: int, chat_xp: int, voice_xp: int) -> None:
+    """يحدد قيمة XP الكتابي والصوتي مباشرة (استبدال، مو إضافة)."""
+    database.execute(
+        """
+        INSERT INTO member_levels (guild_id, user_id, xp, chat_xp, voice_xp)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET
+            xp = excluded.xp,
+            chat_xp = excluded.chat_xp,
+            voice_xp = excluded.voice_xp
+        """,
+        (guild_id, user_id, chat_xp + voice_xp, chat_xp, voice_xp),
+    )
+    database.commit()
 
 
 def get_level_leaderboard(guild_id: int, limit: int = 10) -> list[sqlite3.Row]:
@@ -399,6 +426,57 @@ def get_voice_leaderboard(guild_id: int, limit: int = 5, offset: int = 0) -> lis
         """,
         (guild_id, limit, offset),
     ).fetchall()
+
+
+def get_chat_rank(guild_id: int, user_id: int) -> int:
+    """ترتيب العضو في الشات بين كل أعضاء السيرفر (منذ الأبد)."""
+    chat_xp, _ = get_member_xp_breakdown(guild_id, user_id)
+    row = database.execute(
+        "SELECT COUNT(*) AS c FROM member_levels WHERE guild_id = ? AND chat_xp > ?",
+        (guild_id, chat_xp),
+    ).fetchone()
+    return int(row["c"]) + 1
+
+
+def get_voice_rank(guild_id: int, user_id: int) -> int:
+    """ترتيب العضو في الفويس بين كل أعضاء السيرفر (منذ الأبد)."""
+    _, voice_xp = get_member_xp_breakdown(guild_id, user_id)
+    row = database.execute(
+        "SELECT COUNT(*) AS c FROM member_levels WHERE guild_id = ? AND voice_xp > ?",
+        (guild_id, voice_xp),
+    ).fetchone()
+    return int(row["c"]) + 1
+
+
+def get_average_level(chat_xp: int, voice_xp: int) -> int:
+    """متوسط اللفل الكتابي والصوتي (تقريب لأسفل)."""
+    return (level_from_xp(chat_xp) + level_from_xp(voice_xp)) // 2
+
+
+def get_average_rank(guild_id: int, user_id: int) -> int:
+    """ترتيب العضو حسب متوسط اللفل (كتابي+صوتي)، وعند التعادل حسب إجمالي الـ XP."""
+    rows = database.execute(
+        "SELECT user_id, chat_xp, voice_xp, xp FROM member_levels WHERE guild_id = ?",
+        (guild_id,),
+    ).fetchall()
+
+    def score(chat_xp: int, voice_xp: int) -> tuple[float, int]:
+        avg = (level_from_xp(chat_xp) + level_from_xp(voice_xp)) / 2
+        return avg, chat_xp + voice_xp
+
+    my_chat, my_voice = get_member_xp_breakdown(guild_id, user_id)
+    my_score = score(my_chat, my_voice)
+
+    better = 0
+    for row in rows:
+        if int(row["user_id"]) == user_id:
+            continue
+        chat_xp, voice_xp = int(row["chat_xp"]), int(row["voice_xp"])
+        if chat_xp == 0 and voice_xp == 0 and int(row["xp"]) > 0:
+            chat_xp = int(row["xp"])
+        if score(chat_xp, voice_xp) > my_score:
+            better += 1
+    return better + 1
 
 
 def add_warning(guild_id: int, user_id: int, moderator_id: int, reason: str) -> int:
@@ -809,6 +887,118 @@ def fit_text(
     return f"{shortened}…"
 
 
+def _smooth(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)
+
+
+def _circle_image(data: bytes, diameter: int, ring: int = 0, ring_color=(255, 255, 255, 255)) -> Image.Image:
+    """دائرة ناعمة (Anti-alias) مع إطار اختياري. القيم بالبكسل."""
+    s = 4
+    img = Image.open(BytesIO(data)).convert("RGBA")
+    img = ImageOps.fit(img, (diameter * s, diameter * s), centering=(0.5, 0.5))
+    total = (diameter + ring * 2) * s
+    out = Image.new("RGBA", (total, total), (0, 0, 0, 0))
+    if ring:
+        ImageDraw.Draw(out).ellipse((0, 0, total - 1, total - 1), fill=ring_color)
+    mask = Image.new("L", (diameter * s, diameter * s), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, diameter * s - 1, diameter * s - 1), fill=255)
+    out.paste(img, (ring * s, ring * s), mask)
+    final = diameter + ring * 2
+    return out.resize((final, final), Image.Resampling.LANCZOS)
+
+
+def _rounded_rect_aa(size: tuple[int, int], box, radius: int, fill, outline=None, width: int = 0) -> Image.Image:
+    """مستطيل بحواف ناعمة (Anti-alias) يعاد كصورة RGBA بحجم size."""
+    s = 4
+    w, h = size
+    layer = Image.new("RGBA", (w * s, h * s), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle(
+        tuple(int(v * s) for v in box),
+        radius=int(radius * s),
+        fill=fill,
+        outline=outline,
+        width=int(width * s),
+    )
+    return layer.resize((w, h), Image.Resampling.LANCZOS)
+
+
+def _card_shape_mask(
+    w: int,
+    h: int,
+    k: int = 1,
+    *,
+    left_x: int = 50,
+    low_y: int = 108,
+    high_y: int = 14,
+    wave_x0: int = 190,
+    wave_x1: int = 335,
+    fill_h: int = 200,
+    radius: int = 28,
+) -> Image.Image:
+    """شكل البطاقة: الجهة اليسار منخفضة (تحت الأفاتار) ثم موجة ترتفع لليمين.
+    w,h بالبكسل النهائي، وk معامل التكبير عن التصميم الأساسي."""
+    s = 3
+    m = k * s  # من وحدات التصميم إلى بكسلات الماسك الكبير
+    right_x = w / k - 10
+    bottom = h / k - 10
+
+    mask = Image.new("L", (w * s, h * s), 0)
+    d = ImageDraw.Draw(mask)
+    d.rounded_rectangle(
+        (left_x * m, low_y * m, right_x * m, bottom * m), radius=radius * m, fill=255
+    )
+    pts = []
+    steps = (wave_x1 - wave_x0) * k
+    for i in range(steps + 1):
+        x = wave_x0 + i / k
+        y = low_y - (low_y - high_y) * _smooth((x - wave_x0) / (wave_x1 - wave_x0))
+        pts.append((x * m, y * m))
+    pts += [(wave_x1 * m, fill_h * m), (wave_x0 * m, fill_h * m)]
+    d.polygon(pts, fill=255)
+    d.rounded_rectangle(
+        (wave_x1 * m, high_y * m, right_x * m, fill_h * m),
+        radius=radius * m,
+        fill=255,
+        corners=(False, True, False, False),
+    )
+    return mask.resize((w, h), Image.Resampling.LANCZOS)
+
+
+def _icon_chat(size: int) -> Image.Image:
+    s = 4
+    big = Image.new("RGBA", (size * s, size * s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(big)
+    w, h = size * s, size * s
+    body = (int(w * 0.04), int(h * 0.08), int(w * 0.96), int(h * 0.72))
+    d.rounded_rectangle(body, radius=int(h * 0.16), fill=(240, 240, 245, 255))
+    d.polygon(
+        [(int(w * 0.62), int(h * 0.68)), (int(w * 0.86), int(h * 0.68)), (int(w * 0.86), int(h * 0.94))],
+        fill=(240, 240, 245, 255),
+    )
+    r = int(h * 0.065)
+    for cx in (0.29, 0.5, 0.71):
+        cxp, cyp = int(w * cx), int(h * 0.40)
+        d.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=(120, 122, 135, 255))
+    return big.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def _icon_mic(size: int) -> Image.Image:
+    s = 4
+    big = Image.new("RGBA", (size * s, size * s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(big)
+    w, h = size * s, size * s
+    white = (240, 240, 245, 255)
+    d.rounded_rectangle(
+        (int(w * 0.36), int(h * 0.02), int(w * 0.64), int(h * 0.58)), radius=int(w * 0.14), fill=white
+    )
+    lw = max(2, int(w * 0.075))
+    d.arc((int(w * 0.20), int(h * 0.22), int(w * 0.80), int(h * 0.78)), start=0, end=180, fill=white, width=lw)
+    d.line((int(w * 0.5), int(h * 0.78), int(w * 0.5), int(h * 0.94)), fill=white, width=lw)
+    d.line((int(w * 0.32), int(h * 0.95), int(w * 0.68), int(h * 0.95)), fill=white, width=lw)
+    return big.resize((size, size), Image.Resampling.LANCZOS)
+
+
 def render_level_card(
     *,
     display_name: str,
@@ -818,243 +1008,272 @@ def render_level_card(
     next_level_xp: int,
     chat_xp: int = 0,
     voice_xp: int = 0,
+    chat_rank: Optional[int] = None,
+    voice_rank: Optional[int] = None,
+    background_image: Optional[Image.Image] = None,  # للمعاينة فقط
 ) -> BytesIO:
-    """يرسم بطاقة المستوى ويعيدها كملف PNG جاهز للإرسال في Discord."""
-    if not LEVEL_CARD_BACKGROUND.exists():
-        raise FileNotFoundError(f"خلفية بطاقة الليفل غير موجودة: {LEVEL_CARD_BACKGROUND}")
+    """يرسم بطاقة الرانك بستايل ProBot بدقة عالية (RENDER_SCALE مرة أكبر) وتطلع حادة."""
+    K = RENDER_SCALE
+    W, H = LEVEL_CARD_SIZE
+    WW, HH = W * K, H * K
 
-    canvas = Image.open(LEVEL_CARD_BACKGROUND).convert("RGBA").resize(
-        LEVEL_CARD_SIZE, Image.Resampling.LANCZOS
-    )
+    def p(v: float) -> int:
+        return int(round(v * K))
 
-    dark_overlay = Image.new("RGBA", LEVEL_CARD_SIZE, (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(dark_overlay)
-    for x in range(500):
-        alpha = max(0, 145 - int(x * 145 / 500))
-        overlay_draw.line((x, 0, x, LEVEL_CARD_SIZE[1]), fill=(3, 4, 8, alpha))
-    canvas = Image.alpha_composite(canvas, dark_overlay)
+    # ---- الخلفية كما هي بدون أي تعتيم/تعديل (بس تنقص لتناسب المقاس بدون تمطيط) ----
+    if background_image is not None:
+        bg = background_image.convert("RGBA")
+    else:
+        if not LEVEL_CARD_BACKGROUND.exists():
+            raise FileNotFoundError(f"خلفية بطاقة الليفل غير موجودة: {LEVEL_CARD_BACKGROUND}")
+        bg = Image.open(LEVEL_CARD_BACKGROUND).convert("RGBA")
+    bg = ImageOps.fit(bg, (WW, HH), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
+    canvas = Image.new("RGBA", (WW, HH), (0, 0, 0, 0))
+    canvas.paste(bg, (0, 0), _card_shape_mask(WW, HH, K))
     draw = ImageDraw.Draw(canvas)
 
-    avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA")
-    avatar = ImageOps.fit(avatar, (104, 104), centering=(0.5, 0.5))
-    avatar_mask = Image.new("L", avatar.size, 0)
-    ImageDraw.Draw(avatar_mask).ellipse((0, 0, 103, 103), fill=255)
-    avatar_x, avatar_y = 42, 53
-    canvas.paste(avatar, (avatar_x, avatar_y), avatar_mask)
-    draw.ellipse(
-        (avatar_x - 3, avatar_y - 3, avatar_x + 107, avatar_y + 107),
-        outline=(240, 240, 245, 235),
-        width=3,
-    )
+    # ---- الأفاتار الكبير (يطلع فوق حافة البطاقة زي ProBot) ----
+    av_img = _circle_image(avatar_bytes, p(176), ring=p(5))
+    canvas.alpha_composite(av_img, (p(36), p(32)))
 
-    name_font = load_font(25, bold=True)
-    label_font = load_font(14, bold=True)
-    small_font = load_font(12)
-    name = fit_text(draw, display_name, name_font, 280)
-    draw.text((172, 32), name, font=name_font, fill=(255, 255, 255, 255))
+    # ---- الاسم ----
+    name_font = load_font(p(30), bold=True)
+    sub_font = load_font(p(12))
+    name_x = p(322)
+    name = fit_text(draw, display_name, name_font, WW - p(30) - name_x)
+    draw.text((name_x, p(30)), name, font=name_font, fill=(255, 255, 255, 255))
     draw.text(
-        (172, 67),
-        f"TOTAL LEVEL {level}",
-        font=label_font,
-        fill=(220, 220, 230, 245),
+        (name_x, p(72)),
+        f"TOTAL LEVEL {level}   •   TOTAL XP {xp:,} / {next_level_xp:,}",
+        font=sub_font,
+        fill=(215, 215, 228, 245),
     )
 
-    draw.text(
-        (172, 88),
-        f"TOTAL XP  {xp:,} / {next_level_xp:,}",
-        font=small_font,
-        fill=(225, 225, 235, 235),
-    )
+    # ---- صفّين: شات وفويس ----
+    chat_level, chat_next, chat_pct = progress_for_xp(chat_xp)
+    voice_level, voice_next, voice_pct = progress_for_xp(voice_xp)
 
-    chat_level, chat_next_xp, chat_percent = progress_for_xp(chat_xp)
-    voice_level, voice_next_xp, voice_percent = progress_for_xp(voice_xp)
+    lvl_label_font = load_font(p(12), bold=True)
+    lvl_num_font = load_font(p(34), bold=True)
+    meta_font = load_font(p(12))
+    bar_font = load_font(p(15))
 
-    def draw_progress_bar(
-        label: str,
-        current_level: int,
-        current_xp: int,
-        next_xp: int,
-        percent: int,
-        label_y: int,
-        bar_y: int,
-        fill_color: tuple[int, int, int, int],
-    ) -> None:
-        draw.text(
-            (172, label_y),
-            f"{label}  •  LEVEL {current_level}  •  {percent}%",
-            font=small_font,
-            fill=(225, 225, 235, 255),
+    col_cx = p(286)
+    icon_cx = p(348)
+    bar_x = p(392)
+    bar_w = WW - p(30) - bar_x
+    bar_h = p(26)
+
+    chat_icon = _icon_chat(p(32))
+    mic_icon = _icon_mic(p(32))
+
+    def row(yc, lvl, cur_xp, next_xp, pct, rank, icon):
+        yc = p(yc)
+        # LVL + الرقم الكبير
+        draw.text((col_cx, yc - p(14)), "LVL", font=lvl_label_font, fill=(235, 235, 245, 255), anchor="mm")
+        draw.text((col_cx, yc + p(12)), str(lvl), font=lvl_num_font, fill=(255, 255, 255, 255), anchor="mm")
+        # الأيقونة
+        canvas.alpha_composite(icon, (icon_cx - p(16), yc + p(12) - p(16)))
+        # Rank / Total فوق الشريط
+        rank_text = f"Rank: #{rank}" if rank else "Rank: —"
+        draw.text((bar_x + p(2), yc - p(16)), rank_text, font=meta_font, fill=(225, 225, 235, 255), anchor="lm")
+        draw.text((bar_x + bar_w - p(2), yc - p(16)), f"Total: {cur_xp:,}", font=meta_font, fill=(225, 225, 235, 255), anchor="rm")
+
+        # الشريط: الخلفية فاتحة (لافندر) والجزء المكتمل غامق، زي ProBot (حواف ناعمة)
+        by = yc - p(1)
+        track = _rounded_rect_aa(
+            (bar_w + 1, bar_h + 1),
+            (0, 0, bar_w, bar_h),
+            radius=bar_h // 2,
+            fill=(214, 209, 244, 255),
+            outline=(238, 236, 250, 255),
+            width=p(2),
         )
-        bar_x, bar_width, bar_height = 172, 270, 11
-        draw.rounded_rectangle(
-            (bar_x, bar_y, bar_x + bar_width, bar_y + bar_height),
-            radius=6,
-            fill=(75, 78, 92, 255),
-        )
-        filled_width = int(bar_width * percent / 100)
-        if filled_width:
-            draw.rounded_rectangle(
-                (bar_x, bar_y, bar_x + filled_width, bar_y + bar_height),
-                radius=6,
-                fill=fill_color,
+        canvas.alpha_composite(track, (bar_x, by))
+
+        pad = p(3)
+        inner_w = bar_w - pad * 2
+        fw = int(inner_w * pct / 100)
+        fill_mask = Image.new("L", (bar_w + 1, bar_h + 1), 0)
+        if fw >= bar_h - pad * 2:
+            fill_layer = _rounded_rect_aa(
+                (bar_w + 1, bar_h + 1),
+                (pad, pad, pad + fw, bar_h - pad),
+                radius=(bar_h - pad * 2) // 2,
+                fill=(46, 47, 58, 255),
             )
-        draw.text(
-            (452, label_y),
-            f"{current_xp:,}/{next_xp:,}",
-            font=small_font,
-            fill=(190, 190, 202, 255),
+            canvas.alpha_composite(fill_layer, (bar_x, by))
+            fill_mask = fill_layer.getchannel("A")
+
+        # النص وسط الشريط: أبيض فوق الجزء الغامق، وغامق فوق الفاتح
+        text = f"{cur_xp:,} / {next_xp:,}"
+        text_mask = Image.new("L", (bar_w + 1, bar_h + 1), 0)
+        ImageDraw.Draw(text_mask).text(
+            (bar_w / 2, bar_h / 2 + p(1)), text, font=bar_font, fill=255, anchor="mm"
         )
+        inside = ImageChops.multiply(text_mask, fill_mask)
+        outside = ImageChops.multiply(text_mask, ImageOps.invert(fill_mask))
+        canvas.paste(Image.new("RGBA", text_mask.size, (255, 255, 255, 255)), (bar_x, by), inside)
+        canvas.paste(Image.new("RGBA", text_mask.size, (40, 40, 55, 255)), (bar_x, by), outside)
 
-    draw_progress_bar(
-        "CHAT XP",
-        chat_level,
-        chat_xp,
-        chat_next_xp,
-        chat_percent,
-        label_y=106,
-        bar_y=124,
-        fill_color=(226, 230, 255, 255),
-    )
-    draw_progress_bar(
-        "VOICE XP",
-        voice_level,
-        voice_xp,
-        voice_next_xp,
-        voice_percent,
-        label_y=151,
-        bar_y=169,
-        fill_color=(238, 238, 238, 255),
-    )
+    row(140, chat_level, chat_xp, chat_next, chat_pct, chat_rank, chat_icon)
+    row(214, voice_level, voice_xp, voice_next, voice_pct, voice_rank, mic_icon)
 
-    watermark_font = load_font(12, bold=False)
-    watermark_bbox = draw.textbbox((0, 0), SERVER_WATERMARK, font=watermark_font)
-    watermark_width = watermark_bbox[2] - watermark_bbox[0]
-    draw.text(
-        (LEVEL_CARD_SIZE[0] - watermark_width - 24, 207),
-        SERVER_WATERMARK,
-        font=watermark_font,
-        fill=(190, 190, 198, 255),
-    )
+    # ---- العلامة المائية ----
+    wm_font = load_font(p(12))
+    draw.text((WW - p(26), HH - p(24)), SERVER_WATERMARK, font=wm_font, fill=(200, 200, 208, 255), anchor="rm")
 
-    output = BytesIO()
-    canvas.convert("RGB").save(output, format="PNG", optimize=True)
-    output.seek(0)
-    return output
+    out = BytesIO()
+    canvas.save(out, format="PNG", optimize=True)
+    out.seek(0)
+    return out
+
+
+def format_compact(n: int) -> str:
+    """1,234 / 12.5K / 3.2M عشان الأرقام الكبيرة ما تكسر البطاقة."""
+    if n < 10_000:
+        return f"{n:,}"
+    if n < 1_000_000:
+        return f"{n / 1000:.2f}".rstrip("0").rstrip(".") + "K"
+    return f"{n / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
 
 
 def render_profile_card(
     *,
     display_name: str,
     avatar_bytes: bytes,
-    level: int,
+    avg_level: int,
+    rep: int,
     petals: int,
-    petals_rank: Optional[int],
-    current_xp: int,
-    next_level_xp: int,
+    rank: Optional[int],
+    progress_percent: int,
+    total_xp: int,
+    background_image: Optional[Image.Image] = None,  # للمعاينة فقط
 ) -> BytesIO:
-    """يرسم بطاقة بروفايل مصورة بأسلوب ProBot (أفاتار، إحصائيات، شريط XP)."""
-    if not PROFILE_CARD_BACKGROUND.exists():
-        raise FileNotFoundError(
-            f"خلفية بطاقة البروفايل غير موجودة: {PROFILE_CARD_BACKGROUND}"
-        )
+    """يرسم بطاقة البروفايل بستايل ProBot (أفاتار كبير، عمود إحصائيات، شريط تقدم) بدقة عالية."""
+    K = RENDER_SCALE
+    W, H = PROFILE_CARD_SIZE
+    WW, HH = W * K, H * K
 
-    canvas = Image.open(PROFILE_CARD_BACKGROUND).convert("RGBA").resize(
-        PROFILE_CARD_SIZE, Image.Resampling.LANCZOS
+    def p(v: float) -> int:
+        return int(round(v * K))
+
+    # ---- الخلفية كما هي بدون تعديل (تنقص لتناسب المقاس بدون تمطيط) ----
+    if background_image is not None:
+        bg = background_image.convert("RGBA")
+    else:
+        if not PROFILE_CARD_BACKGROUND.exists():
+            raise FileNotFoundError(
+                f"خلفية بطاقة البروفايل غير موجودة: {PROFILE_CARD_BACKGROUND}"
+            )
+        bg = Image.open(PROFILE_CARD_BACKGROUND).convert("RGBA")
+    bg = ImageOps.fit(bg, (WW, HH), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+
+    # لوحة رمادية شفافة على اليسار لعمود الإحصائيات (زي ProBot)
+    panel = _rounded_rect_aa(
+        (WW, HH),
+        (p(-60), p(240), p(178), p(H + 60)),
+        radius=p(30),
+        fill=(20, 20, 26, 150),
     )
+    bg = Image.alpha_composite(bg, panel)
 
-    # تعتيم خفيف عام حتى تكون النصوص واضحة فوق أي جزء من الخلفية.
-    dark_overlay = Image.new("RGBA", PROFILE_CARD_SIZE, (5, 3, 8, 110))
-    canvas = Image.alpha_composite(canvas, dark_overlay)
-
+    canvas = Image.new("RGBA", (WW, HH), (0, 0, 0, 0))
+    canvas.paste(
+        bg,
+        (0, 0),
+        _card_shape_mask(
+            WW, HH, K, left_x=10, low_y=128, high_y=14, wave_x0=175, wave_x1=300, fill_h=260
+        ),
+    )
     draw = ImageDraw.Draw(canvas)
 
-    # الأفاتار أعلى اليسار بحدود زهرية.
-    avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA")
-    avatar = ImageOps.fit(avatar, (116, 116), centering=(0.5, 0.5))
-    avatar_mask = Image.new("L", avatar.size, 0)
-    ImageDraw.Draw(avatar_mask).ellipse((0, 0, 115, 115), fill=255)
-    avatar_x, avatar_y = 28, 26
-    canvas.paste(avatar, (avatar_x, avatar_y), avatar_mask)
-    draw.ellipse(
-        (avatar_x - 4, avatar_y - 4, avatar_x + 120, avatar_y + 120),
-        outline=(255, 210, 230, 245),
-        width=4,
-    )
+    # ---- الأفاتار الكبير ----
+    av_img = _circle_image(avatar_bytes, p(200), ring=p(6))
+    canvas.alpha_composite(av_img, (p(22), p(22)))
 
-    name_font = load_font(30, bold=True)
-    stat_label_font = load_font(15, bold=True)
-    stat_value_font = load_font(34, bold=True)
-    small_font = load_font(14)
+    # ---- الاسم ----
+    name_font = load_font(p(32), bold=True)
+    name_x = p(268)
+    name = fit_text(draw, display_name, name_font, WW - p(28) - name_x)
+    draw.text((name_x, p(48)), name, font=name_font, fill=(255, 255, 255, 255))
 
-    # اسم العضو يمين الأفاتار.
-    name_x = avatar_x + 116 + 24
-    name = fit_text(draw, display_name, name_font, PROFILE_CARD_SIZE[0] - name_x - 24)
-    draw.text((name_x, avatar_y + 38), name, font=name_font, fill=(255, 255, 255, 255))
-
-    # عمود الإحصائيات (LEVEL, PETALS, RANK) تحت الأفاتار، عمودي زي ProBot.
+    # ---- عمود الإحصائيات: LVL / REP / PETALS / RANK ----
+    label_font = load_font(p(15), bold=True)
+    value_font = load_font(p(34), bold=True)
     stats = [
-        ("LEVEL", str(level)),
-        ("PETALS", f"{petals:,}"),
-        ("RANK", f"#{petals_rank}" if petals_rank else "—"),
+        ("LVL", str(avg_level)),
+        ("REP", f"+{rep:,}"),
+        ("PETALS", format_compact(petals)),
+        ("RANK", f"#{rank:,}" if rank else "—"),
     ]
-    stat_start_y = avatar_y + 116 + 34
-    stat_gap = 78
-    for index, (stat_label, stat_value) in enumerate(stats):
-        y = stat_start_y + index * stat_gap
-        draw.text((avatar_x, y), stat_label, font=stat_label_font, fill=(255, 195, 220, 255))
-        draw.text((avatar_x, y + 20), stat_value, font=stat_value_font, fill=(255, 255, 255, 255))
+    stat_x = p(38)
+    stat_y = 262
+    stat_gap = 76
+    for index, (label, value) in enumerate(stats):
+        y = p(stat_y + index * stat_gap)
+        draw.text((stat_x, y), label, font=label_font, fill=(228, 228, 238, 255))
+        draw.text((stat_x, y + p(22)), value, font=value_font, fill=(255, 255, 255, 255))
 
-    # شريط تقدم XP أسفل البطاقة.
-    bar_x = 28
-    bar_width = PROFILE_CARD_SIZE[0] - (bar_x * 2)
-    bar_y = PROFILE_CARD_SIZE[1] - 56
-    bar_height = 16
-    progress_percent = min(100, max(0, int((current_xp / max(1, next_level_xp)) * 100)))
+    # ---- شريط التقدم (متوسط تقدم الشات والفويس) ----
+    bar_x = p(198)
+    bar_w = WW - p(38) - bar_x
+    bar_h = p(26)
+    bar_y = p(H - 104)
 
-    draw.rounded_rectangle(
-        (bar_x, bar_y, bar_x + bar_width, bar_y + bar_height),
-        radius=8,
-        fill=(45, 32, 42, 220),
+    track = _rounded_rect_aa(
+        (bar_w + 1, bar_h + 1),
+        (0, 0, bar_w, bar_h),
+        radius=bar_h // 2,
+        fill=(214, 209, 244, 255),
+        outline=(238, 236, 250, 255),
+        width=p(2),
     )
-    filled_width = int(bar_width * progress_percent / 100)
-    if filled_width:
-        draw.rounded_rectangle(
-            (bar_x, bar_y, bar_x + filled_width, bar_y + bar_height),
-            radius=8,
-            fill=(255, 200, 225, 255),
+    canvas.alpha_composite(track, (bar_x, bar_y))
+
+    pad = p(3)
+    inner_w = bar_w - pad * 2
+    fw = int(inner_w * max(0, min(100, progress_percent)) / 100)
+    fill_mask = Image.new("L", (bar_w + 1, bar_h + 1), 0)
+    if fw >= bar_h - pad * 2:
+        fill_layer = _rounded_rect_aa(
+            (bar_w + 1, bar_h + 1),
+            (pad, pad, pad + fw, bar_h - pad),
+            radius=(bar_h - pad * 2) // 2,
+            fill=(46, 47, 58, 255),
         )
-    fraction_text = f"{current_xp:,} / {next_level_xp:,}"
-    fraction_bbox = draw.textbbox((0, 0), fraction_text, font=small_font)
-    fraction_width = fraction_bbox[2] - fraction_bbox[0]
-    draw.text(
-        (bar_x + bar_width - fraction_width, bar_y - 20),
-        fraction_text,
-        font=small_font,
-        fill=(230, 220, 228, 255),
+        canvas.alpha_composite(fill_layer, (bar_x, bar_y))
+        fill_mask = fill_layer.getchannel("A")
+
+    bar_font = load_font(p(15))
+    text_mask = Image.new("L", (bar_w + 1, bar_h + 1), 0)
+    ImageDraw.Draw(text_mask).text(
+        (bar_w / 2, bar_h / 2 + p(1)), f"{progress_percent}%", font=bar_font, fill=255, anchor="mm"
     )
+    inside = ImageChops.multiply(text_mask, fill_mask)
+    outside = ImageChops.multiply(text_mask, ImageOps.invert(fill_mask))
+    canvas.paste(Image.new("RGBA", text_mask.size, (255, 255, 255, 255)), (bar_x, bar_y), inside)
+    canvas.paste(Image.new("RGBA", text_mask.size, (40, 40, 55, 255)), (bar_x, bar_y), outside)
+
+    # ---- TOTAL XP تحت الشريط ----
+    total_font = load_font(p(12), bold=True)
     draw.text(
-        (bar_x, bar_y - 20),
-        f"TOTAL XP: {current_xp:,}",
-        font=small_font,
-        fill=(230, 220, 228, 255),
+        (bar_x + bar_w / 2, bar_y + bar_h + p(22)),
+        f"TOTAL XP: {total_xp:,}",
+        font=total_font,
+        fill=(240, 240, 248, 255),
+        anchor="mm",
     )
 
-    # العلامة المائية في الزاوية السفلى اليمنى.
-    watermark_font = load_font(12, bold=False)
-    watermark_bbox = draw.textbbox((0, 0), SERVER_WATERMARK, font=watermark_font)
-    watermark_width = watermark_bbox[2] - watermark_bbox[0]
-    draw.text(
-        (PROFILE_CARD_SIZE[0] - watermark_width - 20, PROFILE_CARD_SIZE[1] - 20),
-        SERVER_WATERMARK,
-        font=watermark_font,
-        fill=(190, 190, 198, 255),
-    )
+    # ---- العلامة المائية ----
+    wm_font = load_font(p(12))
+    draw.text((WW - p(28), HH - p(26)), SERVER_WATERMARK, font=wm_font, fill=(215, 215, 224, 255), anchor="rm")
 
-    output = BytesIO()
-    canvas.convert("RGB").save(output, format="PNG", optimize=True)
-    output.seek(0)
-    return output
+    out = BytesIO()
+    canvas.save(out, format="PNG", optimize=True)
+    out.seek(0)
+    return out
 
 
 def parse_timeout_duration(argument: str) -> timedelta:
@@ -1107,10 +1326,7 @@ async def send_level_up_message(
     source: str,
     visual_test: bool = False,
 ) -> None:
-    """يرسل إشعار رفع المستوى إلى الروم المحدد، ويطبّق رتب المستويات التلقائية."""
-    if not visual_test:
-        await apply_level_role_rewards(member, new_level)
-
+    """يرسل إشعار رفع المستوى إلى الروم المحدد (رتب المستويات تنعطى من notify_level_changes)."""
     level_channel_id = get_level_channel_id(member.guild.id)
     if level_channel_id is None:
         return
@@ -1130,15 +1346,15 @@ async def send_level_up_message(
     level_label = source_level_labels.get(source, "الكتابي")
     try:
         display_name = member.display_name
-        title = f"　　. ︶ {display_name} leveled up　𖹭.ᐟ"
+        title = f"　　. ︶ {display_name} leveled up　♡.ᐟ"
         if visual_test:
             title = f"🎨 (تجربة) {title}"
 
         description = (
-            f"੭੭　  ݂  　 تهانيناً أيّتها الجميلة {member.mention} 　 ݂ "
-            f"<a:white:1481419152198598830>  ꒱\n"
-            f"　　✧　. 　<a:white:1481419279961292850>  "
-            f"مستواكِ {level_label} حاليًا {new_level}   ㅤ.ㅤ  ౨౿"
+            f"੭੭　 ݂  تهانيناً أيّتها الجميلة {member.mention}   ݂ "
+            f"<a:white:1481419152198598830> ꒱\n"
+            f"　✧　. <a:white:1481419279961292850> "
+            f"مستواكِ {level_label} حاليًا {new_level} ㅤ. ౨౿"
         )
 
         embed = discord.Embed(
@@ -1157,6 +1373,34 @@ async def send_level_up_message(
         return
 
 
+async def notify_level_changes(
+    member: discord.Member,
+    old_chat: int,
+    old_voice: int,
+    new_chat: int,
+    new_voice: int,
+) -> None:
+    """يعطي رتب المستويات ويرسل إشعار لكل نوع (كتابي/صوتي) ارتفع مستواه."""
+    old_total_level = level_from_xp(old_chat + old_voice)
+    new_total_level = level_from_xp(new_chat + new_voice)
+    if new_total_level > old_total_level:
+        await apply_level_role_rewards(member, new_total_level)
+
+    if level_from_xp(new_chat) > level_from_xp(old_chat):
+        await send_level_up_message(member, level_from_xp(new_chat), "chat")
+    if level_from_xp(new_voice) > level_from_xp(old_voice):
+        await send_level_up_message(member, level_from_xp(new_voice), "voice")
+
+
+async def award_xp(member: discord.Member, amount: int, source: str) -> None:
+    """يضيف XP (chat / voice / both) ويرسل إشعار رفع لكل نوع ارتفع مستواه."""
+    guild_id = member.guild.id
+    old_chat, old_voice = get_member_xp_breakdown(guild_id, member.id)
+    add_member_xp(guild_id, member.id, amount, source=source)
+    new_chat, new_voice = get_member_xp_breakdown(guild_id, member.id)
+    await notify_level_changes(member, old_chat, old_voice, new_chat, new_voice)
+
+
 @tasks.loop(minutes=1)
 async def voice_xp_loop() -> None:
     """يمنح Voice XP لكل عضو موجود في روم صوتي مرة كل دقيقة."""
@@ -1165,17 +1409,7 @@ async def voice_xp_loop() -> None:
             for member in voice_channel.members:
                 if member.bot:
                     continue
-
-                old_xp, new_xp = add_member_xp(
-                    guild.id,
-                    member.id,
-                    VOICE_XP_PER_MINUTE,
-                    source="voice",
-                )
-                old_level = level_from_xp(old_xp)
-                new_level = level_from_xp(new_xp)
-                if new_level > old_level:
-                    await send_level_up_message(member, new_level, "voice")
+                await award_xp(member, VOICE_XP_PER_MINUTE, "voice")
 
 
 @voice_xp_loop.before_loop
@@ -1233,8 +1467,9 @@ async def on_member_join(member: discord.Member) -> None:
 
 # ---------------------------------------------------------------------------
 # اختصارات بدون علامة ! قبلها — حرف واحد أو كلمة قصيرة (زي pt)
+# بدون منشن = معلوماتك أنت، ومع منشن = معلومات الشخص المنشن
 # ---------------------------------------------------------------------------
-BARE_SHORTCUTS = {"r", "p", "g", "d", "t", "a", "c", "pt"}
+BARE_SHORTCUTS = {"r", "p", "g", "d", "t", "a", "c", "pt", "u"}
 
 
 async def handle_single_letter_shortcut(message: discord.Message) -> bool:
@@ -1254,22 +1489,27 @@ async def handle_single_letter_shortcut(message: discord.Message) -> bool:
     ctx = await bot.get_context(message)
     args = parts[1:]
 
+    # المنشن المكتوب فعليًا في الرسالة فقط (بدون منشن الرد Reply)
+    mentioned = [
+        m for m in message.mentions
+        if f"<@{m.id}>" in content or f"<@!{m.id}>" in content
+    ]
+    target = mentioned[0] if mentioned else ctx.author
+
     try:
         if trigger == "r":
-            await run_rank(ctx, ctx.author)
+            await run_rank(ctx, target)
         elif trigger == "p":
-            await run_profile(ctx, ctx.author)
+            await run_profile(ctx, target)
         elif trigger == "a":
-            target = message.mentions[0] if message.mentions else ctx.author
             await run_avatar(ctx, target)
+        elif trigger == "u":
+            await run_userinfo(ctx, target, reply_to=message)
         elif trigger in ("c", "pt"):
-            target = message.mentions[0] if message.mentions else ctx.author
             amount = None
-            if args:
-                last = args[-1]
-                if last.isdigit():
-                    amount = int(last)
-            if message.mentions and amount is not None:
+            if args and args[-1].isdigit():
+                amount = int(args[-1])
+            if mentioned and amount is not None:
                 await run_give(ctx, target, amount)
             else:
                 await run_balance(ctx, target)
@@ -1281,16 +1521,14 @@ async def handle_single_letter_shortcut(message: discord.Message) -> bool:
         elif trigger == "d":
             await run_daily(ctx)
         elif trigger == "g":
-            if not message.mentions:
-                await ctx.send(
-                    f"طريقة الاستخدام: `g @العضو المبلغ` — مثال: `g @اسم_العضو 100`"
-                )
+            if not mentioned:
+                await ctx.send("طريقة الاستخدام: `g @العضو المبلغ` — مثال: `g @اسم_العضو 100`")
                 return True
             amount_text = args[-1] if args else ""
             if not amount_text.isdigit():
                 await ctx.send("يجب تحديد مبلغ صحيح، مثال: `g @اسم_العضو 100`")
                 return True
-            await run_give(ctx, message.mentions[0], int(amount_text))
+            await run_give(ctx, target, int(amount_text))
     except FileNotFoundError:
         await ctx.send("تعذر إنشاء البطاقة حاليًا، يرجى التحقق من ملفات الخلفية والخط.")
     except (OSError, ValueError, discord.HTTPException):
@@ -1375,16 +1613,11 @@ async def on_message(message: discord.Message) -> None:
 
         if now - last_award >= XP_COOLDOWN_SECONDS:
             xp_cooldowns[cooldown_key] = now
-            old_xp, new_xp = add_member_xp(
-                message.guild.id,
-                message.author.id,
+            await award_xp(
+                message.author,
                 random.randint(MIN_MESSAGE_XP, MAX_MESSAGE_XP),
-                source="chat",
+                "chat",
             )
-            old_level = level_from_xp(old_xp)
-            new_level = level_from_xp(new_xp)
-            if new_level > old_level:
-                await send_level_up_message(message.author, new_level, "chat")
 
     if not message.author.bot and message.guild is not None:
         await handle_smart_replies(message)
@@ -1434,7 +1667,7 @@ async def test_level(ctx: commands.Context) -> None:
     """يعرض بطاقة وترقية وهميتين للاختبار دون تعديل XP الحقيقي."""
     chat_xp, voice_xp, fake_level, next_level_xp = random_visual_test_stats()
     fake_total_xp = chat_xp + voice_xp
-    avatar_bytes = await ctx.author.display_avatar.read()
+    avatar_bytes = await ctx.author.display_avatar.replace(size=512, format="png").read()
     card = render_level_card(
         display_name=ctx.author.display_name,
         avatar_bytes=avatar_bytes,
@@ -1443,6 +1676,8 @@ async def test_level(ctx: commands.Context) -> None:
         next_level_xp=next_level_xp,
         chat_xp=chat_xp,
         voice_xp=voice_xp,
+        chat_rank=random.randint(1, 20),
+        voice_rank=random.randint(1, 20),
     )
     await ctx.send(
         "🎨 تم إنشاء بطاقة ليفل تجريبية بأرقام عشوائية. "
@@ -1478,26 +1713,34 @@ async def run_avatar(ctx_or_interaction, target: discord.Member) -> None:
     await _reply(ctx_or_interaction, embed=embed)
 
 
-async def run_userinfo(ctx_or_interaction, target: discord.Member) -> None:
+async def run_userinfo(
+    ctx_or_interaction,
+    target: discord.Member,
+    reply_to: Optional[discord.Message] = None,
+) -> None:
     if not await ensure_correct_channel(ctx_or_interaction):
         return
-    embed = discord.Embed(
-        title=target.display_name,
-        color=discord.Color.from_rgb(0, 0, 0),
-    )
+    embed = discord.Embed(color=THEME_COLOR)
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(
-        name="Joined Discord",
+        name="Joined Discord :",
         value=discord.utils.format_dt(target.created_at, style="R"),
         inline=True,
     )
     if target.joined_at is not None:
         embed.add_field(
-            name="Joined Server",
+            name="Joined Server :",
             value=discord.utils.format_dt(target.joined_at, style="R"),
             inline=True,
         )
-    await _reply(ctx_or_interaction, embed=embed)
+    embed.set_footer(text=target.name, icon_url=target.display_avatar.url)
+
+    kwargs = {"embed": embed}
+    if reply_to is not None:
+        # يرد كـ Reply على رسالة الشخص بدون ما يمنشنه
+        kwargs["reference"] = reply_to
+        kwargs["mention_author"] = False
+    await _reply(ctx_or_interaction, **kwargs)
 
 
 async def run_rank(ctx_or_interaction, target: discord.Member) -> None:
@@ -1508,7 +1751,7 @@ async def run_rank(ctx_or_interaction, target: discord.Member) -> None:
     chat_xp, voice_xp = get_member_xp_breakdown(guild_id, target.id)
     current_level = level_from_xp(xp)
     next_level_xp = (current_level + 1) ** 2 * 100
-    avatar_bytes = await target.display_avatar.read()
+    avatar_bytes = await target.display_avatar.replace(size=512, format="png").read()
     card = render_level_card(
         display_name=target.display_name,
         avatar_bytes=avatar_bytes,
@@ -1517,6 +1760,8 @@ async def run_rank(ctx_or_interaction, target: discord.Member) -> None:
         next_level_xp=next_level_xp,
         chat_xp=chat_xp,
         voice_xp=voice_xp,
+        chat_rank=get_chat_rank(guild_id, target.id),
+        voice_rank=get_voice_rank(guild_id, target.id),
     )
     await _reply(ctx_or_interaction, file=discord.File(card, filename="rank-card.png"))
 
@@ -1525,25 +1770,21 @@ async def run_profile(ctx_or_interaction, target: discord.Member) -> None:
     if not await ensure_correct_channel(ctx_or_interaction):
         return
     guild_id = target.guild.id
-    xp = get_member_xp(guild_id, target.id)
-    level, next_level_xp, _ = progress_for_xp(xp)
-    petals = get_petals(guild_id, target.id)
+    chat_xp, voice_xp = get_member_xp_breakdown(guild_id, target.id)
+    avg_level = get_average_level(chat_xp, voice_xp)
+    _, _, chat_pct = progress_for_xp(chat_xp)
+    _, _, voice_pct = progress_for_xp(voice_xp)
 
-    leaderboard = get_petals_leaderboard(guild_id, limit=1000)
-    petals_rank = next(
-        (i + 1 for i, row in enumerate(leaderboard) if row["user_id"] == target.id),
-        None,
-    )
-
-    avatar_bytes = await target.display_avatar.read()
+    avatar_bytes = await target.display_avatar.replace(size=512, format="png").read()
     card = render_profile_card(
         display_name=target.display_name,
         avatar_bytes=avatar_bytes,
-        level=level,
-        petals=petals,
-        petals_rank=petals_rank,
-        current_xp=xp,
-        next_level_xp=next_level_xp,
+        avg_level=avg_level,
+        rep=get_reputation(guild_id, target.id),
+        petals=get_petals(guild_id, target.id),
+        rank=get_average_rank(guild_id, target.id),
+        progress_percent=(chat_pct + voice_pct) // 2,
+        total_xp=chat_xp + voice_xp,
     )
     await _reply(ctx_or_interaction, file=discord.File(card, filename="profile-card.png"))
 
@@ -1633,6 +1874,7 @@ PERIOD_LABELS = {
 }
 LEADERBOARD_PAGE_SIZE = 5
 LEADERBOARD_MAX_PAGES = 5  # يعني حتى المركز 25
+LEADERBOARD_SEPARATOR = "꒰ ୨୧ ─ ・┈ ・ ─ ・┈ ─ ・┈ ─ ・┈ ꒱꒱"
 
 
 def _leaderboard_lines(rows, xp_key: str, start_rank: int, unit: str) -> list[str]:
@@ -1654,7 +1896,7 @@ def build_leaderboard_embed(
     if period_label:
         title += f" — {period_label}"
 
-    embed = discord.Embed(title=title, color=THEME_COLOR)
+    embed = discord.Embed(title=title, description=LEADERBOARD_SEPARATOR, color=THEME_COLOR)
     offset = page * LEADERBOARD_PAGE_SIZE
     start_rank = offset + 1
 
@@ -1679,6 +1921,9 @@ def build_leaderboard_embed(
                 value="\n".join(chat_lines),
                 inline=False,
             )
+        if chat_lines and voice_lines:
+            # خط فاصل بين قسم الشات وقسم الفويس
+            embed.add_field(name="\u200b", value=LEADERBOARD_SEPARATOR, inline=False)
         if voice_lines:
             embed.add_field(
                 name=f"{TOP_VOICE_EMOJI} TOP VOICE",
@@ -1686,7 +1931,7 @@ def build_leaderboard_embed(
                 inline=False,
             )
         if not chat_lines and not voice_lines:
-            embed.description = "لا يوجد أي تفاعل مسجل خلال هذه الفترة حتى الآن."
+            embed.description = f"{LEADERBOARD_SEPARATOR}\nلا يوجد أي تفاعل مسجل خلال هذه الفترة حتى الآن."
     else:
         rows = get_petals_leaderboard(guild.id, limit=LEADERBOARD_PAGE_SIZE, offset=offset)
         lines = _leaderboard_lines(rows, "petals", start_rank, str(PETALS_EMOJI))
@@ -1697,8 +1942,10 @@ def build_leaderboard_embed(
                 inline=False,
             )
         else:
-            embed.description = "لا يوجد أي رصيد من عملة Petals مسجل خلال هذه الفترة حتى الآن."
+            embed.description = f"{LEADERBOARD_SEPARATOR}\nلا يوجد أي رصيد من عملة Petals مسجل خلال هذه الفترة حتى الآن."
 
+    if embed.fields:
+        embed.add_field(name="\u200b", value=LEADERBOARD_SEPARATOR, inline=False)
     embed.set_footer(text=f"{SERVER_WATERMARK} • صفحة {page + 1} من {LEADERBOARD_MAX_PAGES}")
     embed.timestamp = datetime.now(timezone.utc)
     return embed
@@ -1771,6 +2018,90 @@ async def run_addpetals(
         f"{PETALS_EMOJI} تمت إضافة **{amount:,}** Petals لـ {target.mention}.\n"
         f"الرصيد الجديد: **{new_balance:,}** {PETALS_EMOJI}",
     )
+
+
+# ---------------------------------------------------------------------------
+# دوال منطقية: أوامر set / send للـ XP واللفل
+#   set  = يستبدل القيمة القديمة بالرقم اللي تكتبه
+#   send = يضيف الرقم فوق القيمة القديمة
+#   النوع: chat (كتابي) / voice (صوتي) / both (الاثنين)
+# ---------------------------------------------------------------------------
+XP_SOURCE_LABELS = {"chat": "الكتابي", "voice": "الصوتي", "both": "الكتابي والصوتي"}
+
+XP_SOURCE_WORDS = {
+    "chat": "chat", "text": "chat", "شات": "chat", "كتابي": "chat",
+    "voice": "voice", "فويس": "voice", "صوتي": "voice",
+    "both": "both", "all": "both", "الكل": "both", "الاثنين": "both",
+}
+
+
+def _new_xp_value(current_xp: int, mode: str, unit: str, value: int) -> int:
+    """يحسب قيمة الـ XP الجديدة حسب نوع العملية (set/send) والوحدة (xp/level)."""
+    if mode == "set":
+        return value if unit == "xp" else xp_for_level(value)
+    # send
+    if unit == "xp":
+        return current_xp + value
+    return xp_for_level(level_from_xp(current_xp) + value)
+
+
+async def run_xp_change(
+    ctx_or_interaction,
+    target: discord.Member,
+    mode: str,
+    unit: str,
+    value: int,
+    source: str,
+) -> None:
+    """mode: set | send  —  unit: xp | level  —  source: chat | voice | both"""
+    if mode == "set":
+        min_value = 0
+    else:
+        min_value = 1
+    max_value = MAX_LEVEL_VALUE if unit == "level" else MAX_XP_VALUE
+    unit_word = "اللفل" if unit == "level" else "الـ XP"
+
+    if value < min_value or value > max_value:
+        await _reply(
+            ctx_or_interaction,
+            f"قيمة {unit_word} لازم تكون بين {min_value:,} و{max_value:,}.",
+        )
+        return
+
+    guild_id = target.guild.id
+    old_chat, old_voice = get_member_xp_breakdown(guild_id, target.id)
+    new_chat, new_voice = old_chat, old_voice
+
+    if mode == "send" and unit == "xp":
+        # إضافة XP عادية (تتسجل بإحصائيات اليوم/الأسبوع/الشهر)
+        add_member_xp(guild_id, target.id, value, source=source)
+        new_chat, new_voice = get_member_xp_breakdown(guild_id, target.id)
+    else:
+        if source in ("chat", "both"):
+            new_chat = _new_xp_value(old_chat, mode, unit, value)
+        if source in ("voice", "both"):
+            new_voice = _new_xp_value(old_voice, mode, unit, value)
+        set_member_xp_raw(guild_id, target.id, new_chat, new_voice)
+
+    source_label = XP_SOURCE_LABELS[source]
+    if mode == "set":
+        text = f"✅ تم تحديد {unit_word} {source_label} لـ {target.mention} إلى **{value:,}**."
+    else:
+        text = f"✅ تم إرسال **{value:,}** من {unit_word} {source_label} لـ {target.mention}."
+
+    lines = [text]
+    if source in ("chat", "both"):
+        lines.append(
+            f"الكتابي: لفل **{level_from_xp(new_chat)}** ({new_chat:,} XP)"
+        )
+    if source in ("voice", "both"):
+        lines.append(
+            f"الصوتي: لفل **{level_from_xp(new_voice)}** ({new_voice:,} XP)"
+        )
+    await _reply(ctx_or_interaction, "\n".join(lines))
+
+    # رتب المستويات + إشعار الرفع (يرسل فقط إذا ارتفع اللفل)
+    await notify_level_changes(target, old_chat, old_voice, new_chat, new_voice)
 
 
 async def run_warnings(ctx_or_interaction, target: Optional[discord.Member]) -> None:
@@ -2404,6 +2735,7 @@ async def warnings_slash(
 
 remove_group = app_commands.Group(name="remove", description="أوامر الحذف")
 add_group = app_commands.Group(name="add", description="أوامر الإضافة")
+send_group = app_commands.Group(name="send", description="[إدارة فقط] إرسال (إضافة) XP أو لفل لعضو")
 
 
 @remove_group.command(name="warn", description="حذف تحذير معين برقمه")
@@ -2415,32 +2747,61 @@ async def removewarn_slash(
     await run_removewarn(interaction, رقم_التحذير)
 
 
-@add_group.command(name="xp", description="إضافة XP للدردشة النصية والصوت للاختبار")
+# خيارات النوع المشتركة لأوامر set / send
+XP_TYPE_CHOICES = [
+    app_commands.Choice(name="كتابي", value="chat"),
+    app_commands.Choice(name="صوتي", value="voice"),
+    app_commands.Choice(name="الاثنين", value="both"),
+]
+
+
+# ---- /send level و /send xp  (يضيف فوق القديم) ----
+@send_group.command(name="level", description="[إدارة فقط] إرسال (إضافة) لفل لعضو فوق لفله الحالي")
 @app_commands.describe(
-    amount="مقدار XP من 1 إلى 100000",
+    level="عدد اللفلات المضافة",
     member="العضو المستهدف، أو اتركه فارغًا لنفسك",
+    النوع="نوع اللفل (الافتراضي: الاثنين)",
 )
+@app_commands.choices(النوع=XP_TYPE_CHOICES)
 @app_commands.checks.has_permissions(administrator=True)
-async def addxp_slash(
+async def send_level_slash(
+    interaction: discord.Interaction,
+    level: int,
+    member: Optional[discord.Member] = None,
+    النوع: Optional[app_commands.Choice[str]] = None,
+) -> None:
+    await run_xp_change(
+        interaction,
+        member or interaction.user,
+        "send",
+        "level",
+        level,
+        النوع.value if النوع else "both",
+    )
+
+
+@send_group.command(name="xp", description="[إدارة فقط] إرسال (إضافة) XP لعضو فوق الـ XP الحالي")
+@app_commands.describe(
+    amount="مقدار XP المضاف",
+    member="العضو المستهدف، أو اتركه فارغًا لنفسك",
+    النوع="نوع الـ XP (الافتراضي: الاثنين)",
+)
+@app_commands.choices(النوع=XP_TYPE_CHOICES)
+@app_commands.checks.has_permissions(administrator=True)
+async def send_xp_slash(
     interaction: discord.Interaction,
     amount: int,
     member: Optional[discord.Member] = None,
+    النوع: Optional[app_commands.Choice[str]] = None,
 ) -> None:
-    if amount < 1 or amount > 100_000:
-        await interaction.response.send_message(
-            "مقدار XP يجب أن يكون بين 1 و100000.", ephemeral=True
-        )
-        return
-
-    target = member or interaction.user
-    old_xp, new_xp = add_member_xp(
-        interaction.guild.id, target.id, amount, source="both"
+    await run_xp_change(
+        interaction,
+        member or interaction.user,
+        "send",
+        "xp",
+        amount,
+        النوع.value if النوع else "both",
     )
-    await interaction.response.send_message(
-        f"تمت إضافة **{amount:,} XP** إلى الدردشة النصية والصوت للعضو {target.mention}."
-    )
-    if level_from_xp(new_xp) > level_from_xp(old_xp):
-        await send_level_up_message(target, level_from_xp(new_xp), "both")
 
 
 @bot.tree.command(name="rank", description="عرض بطاقة المستوى (رانك)")
@@ -2514,9 +2875,6 @@ set_group = app_commands.Group(name="set", description="أوامر الإعدا�
 set_commands_subgroup = app_commands.Group(
     name="commands", description="إعداد قنوات الأوامر", parent=set_group
 )
-set_level_subgroup = app_commands.Group(
-    name="level", description="إعداد إشعارات رفع المستوى", parent=set_group
-)
 set_join_subgroup = app_commands.Group(
     name="join", description="إعداد رتبة الدخول التلقائية", parent=set_group
 )
@@ -2528,8 +2886,58 @@ levelrole_group = app_commands.Group(
 )
 
 
-@set_level_subgroup.command(
-    name="channel", description="[إدارة فقط] تحديد روم إشعارات رفع المستوى"
+# ---- /set level و /set xp  (يستبدل القيمة القديمة بالرقم اللي تكتبه) ----
+@set_group.command(name="level", description="[إدارة فقط] تحديد لفل عضو بقيمة معينة (يستبدل القديم)")
+@app_commands.describe(
+    level="اللفل الجديد",
+    member="العضو المستهدف، أو اتركه فارغًا لنفسك",
+    النوع="نوع اللفل (الافتراضي: الاثنين)",
+)
+@app_commands.choices(النوع=XP_TYPE_CHOICES)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_level_slash(
+    interaction: discord.Interaction,
+    level: int,
+    member: Optional[discord.Member] = None,
+    النوع: Optional[app_commands.Choice[str]] = None,
+) -> None:
+    await run_xp_change(
+        interaction,
+        member or interaction.user,
+        "set",
+        "level",
+        level,
+        النوع.value if النوع else "both",
+    )
+
+
+@set_group.command(name="xp", description="[إدارة فقط] تحديد XP عضو بقيمة معينة (يستبدل القديم)")
+@app_commands.describe(
+    amount="قيمة XP الجديدة",
+    member="العضو المستهدف، أو اتركه فارغًا لنفسك",
+    النوع="نوع الـ XP (الافتراضي: الاثنين)",
+)
+@app_commands.choices(النوع=XP_TYPE_CHOICES)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_xp_slash(
+    interaction: discord.Interaction,
+    amount: int,
+    member: Optional[discord.Member] = None,
+    النوع: Optional[app_commands.Choice[str]] = None,
+) -> None:
+    await run_xp_change(
+        interaction,
+        member or interaction.user,
+        "set",
+        "xp",
+        amount,
+        النوع.value if النوع else "both",
+    )
+
+
+# ملاحظة: أمر تحديد روم إشعارات الرفع صار /set levelchannel (لأن /set level صار لتحديد اللفل)
+@set_group.command(
+    name="levelchannel", description="[إدارة فقط] تحديد روم إشعارات رفع المستوى"
 )
 @app_commands.describe(channel="الروم المطلوب تحديده")
 @app_commands.checks.has_permissions(administrator=True)
@@ -2821,6 +3229,7 @@ bot.tree.add_command(mute_group)
 bot.tree.add_command(set_group)
 bot.tree.add_command(remove_group)
 bot.tree.add_command(add_group)
+bot.tree.add_command(send_group)
 bot.tree.add_command(levelrole_group)
 
 
@@ -3117,22 +3526,47 @@ async def removewarn_prefix(ctx: commands.Context, warning_id: int) -> None:
 @bot.group(name="add", invoke_without_command=True)
 @commands.guild_only()
 async def add_group_prefix(ctx: commands.Context) -> None:
-    await ctx.send("طريقة الاستخدام: `!add xp <المقدار>` أو `!add petals <المقدار>`")
+    await ctx.send("طريقة الاستخدام: `!add petals <المقدار> [@عضو]` — وللـ XP واللفل استخدم `!send` أو `!set`")
 
 
-@add_group_prefix.command(name="xp", aliases=["addxp"])
+# ---- !send level / !send xp  (إضافة فوق القديم) ----
+@bot.group(name="send", invoke_without_command=True)
+@commands.guild_only()
+async def send_group_prefix(ctx: commands.Context) -> None:
+    await ctx.send(
+        "طريقة الاستخدام: `!send xp <المقدار> [@عضو] [chat/voice/both]` أو "
+        "`!send level <العدد> [@عضو] [chat/voice/both]`"
+    )
+
+
+@send_group_prefix.command(name="xp")
 @commands.has_permissions(administrator=True)
-async def addxp_prefix(
-    ctx: commands.Context, amount: int, member: Optional[discord.Member] = None
+async def send_xp_prefix(
+    ctx: commands.Context,
+    amount: int,
+    member: Optional[discord.Member] = None,
+    kind: str = "both",
 ) -> None:
-    if amount < 1 or amount > 100_000:
-        await ctx.send("مقدار XP يجب أن يكون بين 1 و100000.")
+    source = XP_SOURCE_WORDS.get(kind.lower())
+    if source is None:
+        await ctx.send("النوع لازم يكون: `chat` أو `voice` أو `both`.")
         return
-    target = member or ctx.author
-    old_xp, new_xp = add_member_xp(ctx.guild.id, target.id, amount, source="both")
-    await ctx.send(f"تمت إضافة **{amount:,} XP** إلى الدردشة النصية والصوت للعضو {target.mention}.")
-    if level_from_xp(new_xp) > level_from_xp(old_xp):
-        await send_level_up_message(target, level_from_xp(new_xp), "both")
+    await run_xp_change(ctx, member or ctx.author, "send", "xp", amount, source)
+
+
+@send_group_prefix.command(name="level")
+@commands.has_permissions(administrator=True)
+async def send_level_prefix(
+    ctx: commands.Context,
+    amount: int,
+    member: Optional[discord.Member] = None,
+    kind: str = "both",
+) -> None:
+    source = XP_SOURCE_WORDS.get(kind.lower())
+    if source is None:
+        await ctx.send("النوع لازم يكون: `chat` أو `voice` أو `both`.")
+        return
+    await run_xp_change(ctx, member or ctx.author, "send", "level", amount, source)
 
 
 @bot.command(name="rank", aliases=["r"])
@@ -3207,7 +3641,56 @@ async def top_prefix(
 @bot.group(name="set", invoke_without_command=True)
 @commands.guild_only()
 async def set_group_prefix(ctx: commands.Context) -> None:
-    await ctx.send("طريقة الاستخدام: `!set commands channel #القناة`")
+    await ctx.send(
+        "طريقة الاستخدام: `!set level <اللفل> [@عضو] [chat/voice/both]` أو "
+        "`!set xp <المقدار> [@عضو] [chat/voice/both]` أو `!set commands channel #القناة`"
+    )
+
+
+@set_group_prefix.command(name="xp")
+@commands.has_permissions(administrator=True)
+async def set_xp_prefix(
+    ctx: commands.Context,
+    amount: int,
+    member: Optional[discord.Member] = None,
+    kind: str = "both",
+) -> None:
+    source = XP_SOURCE_WORDS.get(kind.lower())
+    if source is None:
+        await ctx.send("النوع لازم يكون: `chat` أو `voice` أو `both`.")
+        return
+    await run_xp_change(ctx, member or ctx.author, "set", "xp", amount, source)
+
+
+@set_group_prefix.group(name="level", invoke_without_command=True)
+@commands.has_permissions(administrator=True)
+async def set_level_group_prefix(
+    ctx: commands.Context,
+    amount: Optional[int] = None,
+    member: Optional[discord.Member] = None,
+    kind: str = "both",
+) -> None:
+    # !set level <اللفل> [@عضو] [نوع]  |  !set level channel #الروم
+    if amount is None:
+        await ctx.send(
+            "طريقة الاستخدام: `!set level <اللفل> [@عضو] [chat/voice/both]` "
+            "أو `!set level channel #الروم`"
+        )
+        return
+    source = XP_SOURCE_WORDS.get(kind.lower())
+    if source is None:
+        await ctx.send("النوع لازم يكون: `chat` أو `voice` أو `both`.")
+        return
+    await run_xp_change(ctx, member or ctx.author, "set", "level", amount, source)
+
+
+@set_level_group_prefix.command(name="channel")
+@commands.has_permissions(administrator=True)
+async def set_level_channel_prefix(
+    ctx: commands.Context, channel: discord.TextChannel
+) -> None:
+    set_level_channel_id(ctx.guild.id, channel.id)
+    await ctx.send(f"✅ تم تحديد {channel.mention} كروم لإشعارات رفع المستوى.")
 
 
 @set_group_prefix.group(name="commands", invoke_without_command=True)
@@ -3227,20 +3710,6 @@ async def setcommandschannel_prefix(
         f"✅ تمت إضافة القناة {channel.mention} إلى قائمة القنوات المسموح فيها بتنفيذ الأوامر.\n"
         f"القنوات المسموحة حاليًا: {channels_text}"
     )
-
-
-@set_group_prefix.group(name="level", invoke_without_command=True)
-async def set_level_group_prefix(ctx: commands.Context) -> None:
-    await ctx.send("طريقة الاستخدام: `!set level channel #الروم`")
-
-
-@set_level_group_prefix.command(name="channel")
-@commands.has_permissions(administrator=True)
-async def set_level_channel_prefix(
-    ctx: commands.Context, channel: discord.TextChannel
-) -> None:
-    set_level_channel_id(ctx.guild.id, channel.id)
-    await ctx.send(f"✅ تم تحديد {channel.mention} كروم لإشعارات رفع المستوى.")
 
 
 @set_group_prefix.group(name="join", invoke_without_command=True)
@@ -3355,7 +3824,9 @@ COMMAND_PARAMS: dict[str, list[tuple[str, str, bool]]] = {
     "kick": [("member", "العضو", True), ("reason", "السبب", False)],
     "timeout": [("member", "العضو", True), ("duration", "المدة", True), ("reason", "السبب", False)],
     "give": [("member", "العضو", True), ("amount", "المبلغ", True)],
-    "add xp": [("amount", "المقدار", True), ("member", "العضو", False)],
+    "send xp": [("amount", "المقدار", True), ("member", "العضو", False), ("kind", "النوع", False)],
+    "send level": [("amount", "العدد", True), ("member", "العضو", False), ("kind", "النوع", False)],
+    "set xp": [("amount", "المقدار", True), ("member", "العضو", False), ("kind", "النوع", False)],
     "add petals": [("amount", "المقدار", True), ("member", "العضو", False)],
     "clear": [("amount", "العدد", True)],
     "set commands channel": [("channel", "القناة", True)],
